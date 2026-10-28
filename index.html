@@ -54,6 +54,9 @@ button.primary{background:var(--button-bg);color:var(--button-ink)}button.primar
 #readingDimmer{position:absolute;inset:0;z-index:9;background:#000;opacity:0;pointer-events:none}#readingDimmer.adjusting{will-change:opacity}
 #brightnessHud{position:absolute;top:max(88px,calc(env(safe-area-inset-top) + 72px));left:50%;transform:translateX(-50%);z-index:12;display:flex;align-items:center;gap:9px;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:22px;padding:10px 16px;font-size:12px;white-space:nowrap;pointer-events:none;box-shadow:0 4px 22px #0002}#brightnessHud strong{font-variant-numeric:tabular-nums}#brightnessHud>span{font-size:19px;line-height:1}
 .field-help{font-size:11px;color:var(--muted);line-height:1.6}.theme-toggle small{display:block;font-size:10px;font-weight:400;color:var(--muted);line-height:1.6;margin-top:4px}.theme-toggle input:disabled{opacity:.4}
+/* Keep selection paints and handle movement separate from the long book. */
+.selection-layer{contain:strict;isolation:isolate;transform:translateZ(0)}
+.selection-handle{left:0;top:0;contain:layout style;will-change:transform}
 </style>
 </head>
 <body>
@@ -256,6 +259,7 @@ function selectionChanged(){
 // for user-select:none, so the fallback searches source offsets logarithmically.
 // It never walks a paragraph character by character or toggles overlay styles.
 function caretAtPoint(x,y){
+ const cached=cachedSelectionPoint(x,y);if(cached)return cached;
  let node,offset;
  try{
   if(document.caretPositionFromPoint){const p=document.caretPositionFromPoint(x,y);if(p){node=p.offsetNode;offset=p.offset}}
@@ -301,18 +305,18 @@ function caretAtPoint(x,y){
 let selectionSegmenter=null,segmenterLanguage='',lastWordBounds=null,pendingSelectionPoint=null,caretHitCache=new WeakMap();
 function wordBounds(chapter,offset){
  const text=plainText(chapter);if(!text.length)return null;let p=Math.max(0,Math.min(text.length-1,offset));
- if(!isLetter(text[p])&&p>0&&isLetter(text[p-1]))p--;
  if(lastWordBounds?.text===text&&p>=lastWordBounds.start&&p<lastWordBounds.end)return{start:lastWordBounds.start,end:lastWordBounds.end};
+ const limits=blockSourceBounds(chapter,p);if(!isLetter(text[p])&&p>limits.start&&isLetter(text[p-1]))p--;
  // Segment a small neighborhood, not the entire chapter, on each handle move.
  if(typeof Intl.Segmenter==='function')try{
   const language=active.language||'en';if(!selectionSegmenter||segmenterLanguage!==language){selectionSegmenter=new Intl.Segmenter(language,{granularity:'word'});segmenterLanguage=language}
-  const base=Math.max(0,p-256),segment=selectionSegmenter.segment(text.slice(base,p+257)).containing(p-base);
-  if(segment?.isWordLike&&segment.index>0&&segment.index+segment.segment.length<Math.min(text.length-base,p+257-base)){
+  const base=Math.max(limits.start,p-256),limit=Math.min(limits.end,p+257),segment=selectionSegmenter.segment(text.slice(base,limit)).containing(p-base);
+  if(segment?.isWordLike&&(segment.index>0||base===limits.start)&&(segment.index+segment.segment.length<limit-base||limit===limits.end)){
    const bounds={start:base+segment.index,end:base+segment.index+segment.segment.length};lastWordBounds={...bounds,text};return bounds;
   }
  }catch{}
  const isPart=c=>!!c&&/[\p{L}\p{N}\p{M}_'’\-]/u.test(c);if(!isPart(text[p]))return null;
- let start=p,end=p+1;while(start>0&&isPart(text[start-1]))start--;while(end<text.length&&isPart(text[end]))end++;
+ let start=p,end=p+1;while(start>limits.start&&isPart(text[start-1]))start--;while(end<limits.end&&isPart(text[end]))end++;
  lastWordBounds={text,start,end};return{start,end};
 }
 function selectTouchRange(chapter,start,end){
@@ -323,19 +327,19 @@ function selectTouchRange(chapter,start,end){
  touchSelection={chapter,start,end,word:text.slice(start,end),custom:true};selection=touchSelection;
  if(first)getSelection()?.removeAllRanges();
  // Read all text geometry before writing the highlight and toolbar DOM.
- paintTouchSelection();showSelectionTools(touchSelection);return true;
+ paintTouchSelection();if(!handleDrag&&!touchGesture?.long)showSelectionTools(touchSelection);return true;
 }
 function selectionHaptic(){
  if(!settings.selectionHaptics||typeof navigator.vibrate!=='function')return true;
  try{return navigator.vibrate(10)!==false}catch{return true}
 }
 function selectWordAt(x,y){
- const point=caretAtPoint(x,y);if(!point)return false;const word=wordBounds(point.chapter,point.offset);if(!word)return false;
+ const point=caretAtPoint(x,y);if(!point)return false;const word=point.bounds||wordBounds(point.chapter,point.offset);if(!word)return false;
  toggleChrome(false);const selected=selectTouchRange(point.chapter,word.start,word.end);
  if(selected&&touchGesture)touchGesture.hapticOnRelease=!selectionHaptic();else if(selected)selectionHaptic();return selected;
 }
 function paintTouchSelection(){
- if(!touchSelection||!active)return;const sec=chapterElements.find(el=>+el.dataset.chapter===touchSelection.chapter);if(!sec)return;
+ if(!touchSelection||!active)return;if(paintIndexedSelection())return;const sec=chapterElements.find(el=>+el.dataset.chapter===touchSelection.chapter);if(!sec)return;
  const box=$('viewport').getBoundingClientRect();let {start,end}=touchSelection;
  // A chapter-wide Copy selection can contain millions of characters. Measure
  // only its visible slice; the complete source selection remains unchanged.
@@ -346,22 +350,11 @@ function paintTouchSelection(){
   start=lower(start,end,before);end=lower(start,end,inside);
  }
  const range=start<end?rangeAt(sec,start,end):null,rects=range?[...range.getClientRects()].filter(r=>r.width&&r.height&&r.right>box.left&&r.left<box.right&&r.bottom>box.top&&r.top<box.bottom):[];
- rects.sort((a,b)=>Math.abs(a.top-b.top)>2?a.top-b.top:a.left-b.left);
- const lines=[];
- for(const r of rects){
-  const b={left:Math.max(box.left,r.left),right:Math.min(box.right,r.right),top:Math.max(box.top,r.top),bottom:Math.min(box.bottom,r.bottom)},last=lines[lines.length-1];
-  if(last&&Math.abs(last.top-b.top)<2&&Math.abs(last.bottom-b.bottom)<3&&b.left<=last.right+3)last.right=Math.max(last.right,b.right);else lines.push(b);
- }
  const handles=[['selectionStart',touchSelection.start,false],['selectionEnd',touchSelection.end,true]].map(([id,offset,isEnd])=>{
   const r=rangeAt(sec,isEnd?Math.max(touchSelection.start,offset-1):offset,isEnd?offset:offset+1),rs=r?.getClientRects(),rect=rs?.[isEnd?rs.length-1:0];
   return{id,rect,isEnd,visible:rect&&rect.bottom>box.top&&rect.bottom<box.bottom&&rect.left>=box.left-1&&rect.right<=box.right+1};
  });
- const layer=$('selectionLayer');
- // Reuse rectangles while dragging. Never touch the book's text DOM.
- while(layer.children.length<lines.length){const el=document.createElement('div');el.className='selection-rect';layer.append(el)}
- [...layer.children].forEach((mark,i)=>{mark.hidden=i>=lines.length;if(i<lines.length){const r=lines[i];Object.assign(mark.style,{left:r.left+'px',top:r.top+'px',width:r.right-r.left+'px',height:r.bottom-r.top+'px'})}});
- layer.hidden=!lines.length;
- for(const {id,rect,isEnd,visible} of handles){const handle=$(id);handle.hidden=!visible;if(visible){handle.style.left=((isEnd?rect.right:rect.left)-15)+'px';handle.style.top=rect.bottom-3+'px'}}
+ commitSelectionPaint(rects,handles,box);
 }
 function queueSelectionPoint(x,y,edge,anchor){
  pendingSelectionPoint={x,y,edge,anchor};if(selectionFrame)return;
@@ -371,11 +364,92 @@ function flushSelectionPoint(){
  cancelAnimationFrame(selectionFrame);selectionFrame=0;const pending=pendingSelectionPoint;pendingSelectionPoint=null;
  if(!pending||!touchSelection||!active)return;
  const point=caretAtPoint(pending.x,pending.y);if(!point||point.chapter!==touchSelection.chapter)return;
- const bounds=wordBounds(point.chapter,point.offset);if(!bounds)return;
+ const bounds=point.bounds||wordBounds(point.chapter,point.offset);if(!bounds)return;
  const start=pending.edge==='end'?touchSelection.start:pending.edge==='start'?Math.min(bounds.start,touchSelection.end-1):Math.min(pending.anchor.start,bounds.start);
  const end=pending.edge==='start'?touchSelection.end:pending.edge==='end'?Math.max(bounds.end,touchSelection.start+1):Math.max(pending.anchor.end,bounds.end);
  selectTouchRange(point.chapter,start,end);
 }
+
+// Keep a small map of the visible text. Build it in short, cancelable slices
+// before a hold completes; dragging then needs no text-layout measurements.
+const SELECTION_HOLD_MS=350;
+const SELECTION_BLOCKS='p,li,h1,h2,h3,h4,h5,h6,blockquote,pre,td,th,figcaption';
+function blockSourceBounds(chapter,offset){
+ const sec=chapterElements.find(el=>+el.dataset.chapter===chapter),point=sec&&pointAt(sec,offset),block=point?.node.parentElement?.closest(SELECTION_BLOCKS);
+ if(!block)return{start:0,end:plainText(chapter).length};const list=textNodes(block);return list.length?{start:offsetAt(sec,list[0].node,0),end:offsetAt(sec,list[list.length-1].node,list[list.length-1].node.length)}:{start:offset,end:offset+1};
+}
+let selectionView=null,selectionViewTimer=0,selectionGeometryVersion=0;
+const selectionHandleGeometry=new Map();
+function validSelectionView(view=selectionView){return !!view&&view.id===active?.id&&view.seq===renderSeq&&view.epoch===contentEpoch&&view.version===selectionGeometryVersion}
+function invalidateSelectionView(){selectionGeometryVersion++;selectionView=null;clearTimeout(selectionViewTimer)}
+function warmSelectionView(chapter,delay=70){
+ clearTimeout(selectionViewTimer);selectionViewTimer=setTimeout(()=>{if(active&&!suppress&&!settings.nativeSelection&&$('noteOverlay').hidden&&$('drawerOverlay').hidden)prepareSelectionView(chapter)},delay);
+}
+function prepareSelectionView(chapter=state?.position.chapter){
+ if(!active||suppress||settings.nativeSelection)return null;
+ if(validSelectionView()&&selectionView.chapter===chapter)return selectionView;
+ const sec=chapterElements.find(el=>+el.dataset.chapter===chapter);if(!sec)return null;
+ const vp=$('viewport'),box=vp.getBoundingClientRect(),text=plainText(chapter),length=text.length;
+ const lower=(lo,hi,test)=>{while(lo<hi){const mid=(lo+hi)>>1,r=charRectAt(sec,mid);if(r&&test(r))lo=mid+1;else hi=mid}return lo};
+ const before=r=>settings.mode==='pages'?r.right<=box.left||r.left<box.right&&r.bottom<box.top-90:r.bottom<box.top-90;
+ const within=r=>settings.mode==='pages'?r.right<=box.left||r.left<box.right&&r.top<box.bottom+90:r.top<box.bottom+90;
+ const visibleStart=lower(0,length,before),visibleEnd=lower(visibleStart,length,within),base=Math.max(0,visibleStart-96),end=Math.min(length,visibleEnd+96,base+16000);
+ const segments=[],nodes=textNodes(sec),cuts=[base];let lo=0,hi=nodes.length;
+ while(lo<hi){const mid=(lo+hi)>>1;if(nodes[mid].end<=base)lo=mid+1;else hi=mid}
+ let previousBlock=null;
+ for(let i=lo;i<nodes.length&&nodes[i].start<end;i++){const t=nodes[i],block=t.node.parentElement?.closest(SELECTION_BLOCKS)||sec;if(previousBlock&&block!==previousBlock&&t.start>base)cuts.push(t.start);previousBlock=block}cuts.push(end);
+ try{
+  const lang=active.language||'en';if(!selectionSegmenter||segmenterLanguage!==lang){selectionSegmenter=new Intl.Segmenter(lang,{granularity:'word'});segmenterLanguage=lang}
+  for(let i=0;i<cuts.length-1;i++)for(const s of selectionSegmenter.segment(text.slice(cuts[i],cuts[i+1])))if(s.segment.trim())segments.push({start:cuts[i]+s.index,end:cuts[i]+s.index+s.segment.length,word:!!s.isWordLike});
+ }catch{for(let i=0;i<cuts.length-1;i++)for(const m of text.slice(cuts[i],cuts[i+1]).matchAll(/[\p{L}\p{N}\p{M}_'’\-]+|[^\s]/gu))segments.push({start:cuts[i]+m.index,end:cuts[i]+m.index+m[0].length,word:/[\p{L}\p{N}\p{M}]/u.test(m[0])})}
+ const view={id:active.id,seq:renderSeq,epoch:contentEpoch,version:selectionGeometryVersion,chapter,box,entries:[],words:[],ready:false};selectionView=view;
+ let cursor=0,resolve;view.done=new Promise(r=>resolve=r);
+ const build=()=>{
+  if(!validSelectionView(view)||selectionView!==view){resolve(false);return}
+  const time=performance.now();let batch=0;
+  while(cursor<segments.length&&batch++<32&&performance.now()-time<3){
+   const s=segments[cursor++],range=rangeAt(sec,s.start,s.end),rects=range?[...range.getClientRects()].filter(r=>r.width&&r.height&&r.right>box.left&&r.left<box.right&&r.bottom>box.top-90&&r.top<box.bottom+90):[];
+   if(rects.length){const entry={...s,rects};view.entries.push(entry);if(s.word)view.words.push(entry)}
+  }
+  if(cursor<segments.length)requestAnimationFrame(build);else{view.ready=true;resolve(true)}
+ };
+ requestAnimationFrame(build);return view;
+}
+function cachedSelectionPoint(x,y){
+ const v=selectionView;if(!validSelectionView(v)||!v.ready)return null;
+ let nearest=null,best=Infinity;
+ for(const word of v.words)for(const r of word.rects){const d=Math.max(r.top-y,0,y-r.bottom)*4+Math.max(r.left-x,0,x-r.right);if(d<best){best=d;nearest=word}if(d===0)break}
+ return nearest&&best<60?{chapter:v.chapter,offset:nearest.start,bounds:{start:nearest.start,end:nearest.end}}:null;
+}
+function commitSelectionPaint(rects,handles,box){
+ const clipped=rects.filter(r=>r.right>box.left&&r.left<box.right&&r.bottom>box.top&&r.top<box.bottom);
+ clipped.sort((a,b)=>Math.abs(a.top-b.top)>2?a.top-b.top:a.left-b.left);
+ const lines=[];
+ for(const r of clipped){const b={left:Math.max(box.left,r.left),right:Math.min(box.right,r.right),top:Math.max(box.top,r.top),bottom:Math.min(box.bottom,r.bottom)},last=lines[lines.length-1];
+  if(last&&Math.abs(last.top-b.top)<2&&Math.abs(last.bottom-b.bottom)<3&&b.left<=last.right+12)last.right=Math.max(last.right,b.right);else lines.push(b);
+ }
+ const layer=$('selectionLayer');
+ while(layer.children.length<lines.length){const el=document.createElement('div');el.className='selection-rect';layer.append(el)}
+ [...layer.children].forEach((mark,i)=>{mark.hidden=i>=lines.length;if(i<lines.length){const r=lines[i],key=`${r.left},${r.top},${r.right},${r.bottom}`;if(mark._folioBox!==key){mark._folioBox=key;mark.style.cssText=`left:${r.left}px;top:${r.top}px;width:${r.right-r.left}px;height:${r.bottom-r.top}px`}}});
+ layer.hidden=!lines.length;
+ for(const {id,rect,isEnd} of handles){
+  const handle=$(id),visible=rect&&rect.bottom>box.top&&rect.bottom<box.bottom&&rect.left>=box.left-1&&rect.right<=box.right+1;
+  handle.hidden=!visible;if(visible){selectionHandleGeometry.set(id,rect);const transform=`translate3d(${(isEnd?rect.right:rect.left)-15}px,${rect.bottom-3}px,0)`;if(handle.style.transform!==transform)handle.style.transform=transform}
+ }
+}
+function paintIndexedSelection(){
+ const v=selectionView;if(!touchSelection||!validSelectionView(v)||!v.ready||v.chapter!==touchSelection.chapter)return false;
+ const {start,end}=touchSelection,sec=chapterElements.find(el=>+el.dataset.chapter===v.chapter),rects=[];
+ let first,last;
+ for(const entry of v.entries){
+  if(entry.end<=start||entry.start>=end)continue;
+  const rs=entry.start<start||entry.end>end?[...rangeAt(sec,Math.max(start,entry.start),Math.min(end,entry.end)).getClientRects()]:entry.rects;
+  rects.push(...rs);if(entry.start<=start&&entry.end>start)first=rs[0];if(entry.start<end&&entry.end>=end)last=rs[rs.length-1];
+ }
+ commitSelectionPaint(rects,[{id:'selectionStart',rect:first,isEnd:false},{id:'selectionEnd',rect:last,isEnd:true}],v.box);return true;
+}
+function selectionDragStarted(){if(!$('selectionTools').hidden)$('selectionTools').hidden=true}
+function selectionDragFinished(){if(touchSelection)showSelectionTools(touchSelection)}
 
 function expandSelection(){
  const picked=getSelected()||selection;if(!picked)return;const text=plainText(picked.chapter);
@@ -506,7 +580,7 @@ function plainText(chapter){
 }
 function annotate(roots=chapterElements){
  if(!state)return;
- nodeIndexCache=new WeakMap();caretHitCache=new WeakMap();
+ nodeIndexCache=new WeakMap();caretHitCache=new WeakMap();invalidateSelectionView();
  for(const sec of roots){
   sec.querySelectorAll('mark[data-notes]').forEach(m=>m.replaceWith(...m.childNodes));sec.normalize();nodeIndexCache.delete(sec);
   const text=sec.textContent,chapter=+sec.dataset.chapter,events=[],ends=new Set();chapterTextCache.set(chapter,text);
@@ -566,7 +640,7 @@ function pumpImages(){
    await new Promise(resolve=>{im.onload=()=>resolve(true);im.onerror=()=>resolve(false);im.src=src;if(im.complete)resolve(true)});
    if(!im.isConnected||active?.id!==id)return;im.dataset.hydrated='true';
    if(im.naturalWidth&&im.naturalHeight){state.imageSizes||={};state.imageSizes[im.dataset.asset]={width:im.naturalWidth,height:im.naturalHeight};im.style.minHeight='';im.style.aspectRatio=im.naturalWidth+' / '+im.naturalHeight;queueSave();
-    caretHitCache=new WeakMap();pageMetricsDirty=true;if(settings.mode==='pages')scheduleImageLayout();
+    caretHitCache=new WeakMap();invalidateSelectionView();warmSelectionView();pageMetricsDirty=true;if(settings.mode==='pages')scheduleImageLayout();
    }
   }catch{im.alt=im.alt||'Illustration unavailable'}finally{imageJobs--;pumpImages()}})();
  }
@@ -588,7 +662,7 @@ async function layout(pos=state.position,rebuild=false){
  try{if(rebuild)renderContent(pos.chapter);pageMetricsDirty=true;await frame();if(seq!==renderSeq||!active)return;
   updatePages();scrollToPosition(pos);suppress=false;updateLocation(false,pos);queueSave();
   // Images do not hold the book or the controls in a disabled state.
-  if(rebuild)void hydrateImages();
+  if(rebuild)void hydrateImages();warmSelectionView(pos.chapter);
  }finally{if(seq===renderSeq)suppress=false}
 }
 async function openBook(id){
@@ -652,7 +726,7 @@ function syncVisualViewport(){
 }
 function scheduleVisualViewport(){if(visualFrame)return;visualFrame=requestAnimationFrame(()=>{visualFrame=0;syncVisualViewport()})}
 function handleReaderResize(){
- scheduleVisualViewport();if(!active||!$('noteOverlay').hidden)return;
+ invalidateSelectionView();scheduleVisualViewport();if(!active||!$('noteOverlay').hidden)return;
  const width=$('viewport').clientWidth,height=$('viewport').clientHeight,widthChanged=Math.abs(width-lastReaderWidth)>1;
  if(!widthChanged&&(settings.mode==='scroll'||Math.abs(height-lastReaderHeight)<2))return;
  clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{
@@ -661,7 +735,18 @@ function handleReaderResize(){
   pageMetricsDirty=true;updatePages();scrollToPosition(state.position);updateLocation(false,state.position);
  },180);
 }
-function blockNativeSelectionMove(e){if(touchGesture?.long&&e.cancelable)e.preventDefault()}
+function dragTouchSelectionTo(x,y){
+ const g=touchGesture;if(!g?.long||!touchSelection)return;g.selectionMoved=true;g.lastX=x;g.lastY=y;selectionDragStarted();queueSelectionPoint(x,y,'extend',g.anchor);
+}
+function finishTouchSelection(x,y,cancelled=false){
+ const g=touchGesture;if(!g?.long)return;
+ if(cancelled){pendingSelectionPoint=null;cancelAnimationFrame(selectionFrame);selectionFrame=0}
+ else{if(g.selectionMoved&&Number.isFinite(x)&&Number.isFinite(y))dragTouchSelectionTo(x,y);flushSelectionPoint();if(g.hapticOnRelease&&touchSelection)selectionHaptic()}
+ stopSelectionGesture();touchGesture=null;ignoreClickUntil=Date.now()+500;selectionDragFinished();
+}
+function blockNativeSelectionMove(e){
+ if(!touchGesture?.long||e.touches.length!==1)return;if(e.cancelable)e.preventDefault();const t=e.touches[0];dragTouchSelectionTo(t.clientX,t.clientY);
+}
 function startSelectionGesture(){
  $('viewport').addEventListener('touchmove',blockNativeSelectionMove,{passive:false});
 }
@@ -742,7 +827,7 @@ $('cancelRemove').onclick=()=>{$('confirmOverlay').hidden=true;removeId=null};$(
 $('bookProgress').addEventListener('input',e=>{$('percentLabel').textContent=(e.target.value/10).toFixed(0)+'%'});$('bookProgress').addEventListener('change',async e=>{const val=+e.target.value;await gotoPosition(positionAtProgress(val/1000));if(val===1000){state.progress=1;queueSave();$('percentLabel').textContent='100%';$('bookProgress').value=1000}});
 function cancelHold(){clearTimeout(holdTimer);holdTimer=null}
 function scheduleLocation(){
- if(locationFrame||suppress)return;
+ if(locationFrame||suppress||handleDrag||touchGesture?.long)return;
  locationFrame=requestAnimationFrame(()=>{locationFrame=0;updateLocation()});
 }
 let brightnessFrame=0,brightnessTimer=0,brightnessSaveTimer=0;
@@ -772,19 +857,20 @@ function updateBrightnessDrag(){
 function queueBrightnessDrag(){if(!brightnessFrame)brightnessFrame=requestAnimationFrame(updateBrightnessDrag)}
 
 $('viewport').addEventListener('scroll',()=>{
- if(suppress)return;lastScrollAt=Date.now();cancelHold();if(!handleDrag)hideSelection();
- clearTimeout(scrollTimer);scrollTimer=setTimeout(scheduleLocation,200);
+ if(suppress)return;lastScrollAt=Date.now();cancelHold();invalidateSelectionView();
+ if(!handleDrag&&!touchGesture?.long)hideSelection();
+ clearTimeout(scrollTimer);scrollTimer=setTimeout(()=>{scheduleLocation();warmSelectionView(touchSelection?.chapter??state?.position.chapter,0)},200);
 },{passive:true});
 $('viewport').addEventListener('pointerdown',e=>{
  if(e.isPrimary===false||e.button>0||suppress||!active)return;
  const custom=e.pointerType==='touch'&&!settings.nativeSelection;
  $('reader').classList.toggle('touch-selection',custom);
  touchGesture={id:e.pointerId,x:e.clientX,y:e.clientY,currentX:e.clientX,time:Date.now(),scroll:$('viewport').scrollTop,custom,long:false,moved:false,axis:'',hadSelection:!!getSelected(),canBrighten:e.pointerType==='touch'&&settings.swipeBrightness&&!e.target.closest('a'),startBrightness:settings.brightness};
- cancelHold();if(!custom||e.target.closest('a'))return;
+ cancelHold();if(!custom||e.target.closest('a'))return;prepareSelectionView(+(sectionOf(e.target)?.dataset.chapter??state.position.chapter));
  holdTimer=setTimeout(()=>{
   if(!touchGesture||touchGesture.moved)return;
-  if(selectWordAt(touchGesture.x,touchGesture.y)){touchGesture.long=true;touchGesture.anchor={start:touchSelection.start,end:touchSelection.end};startSelectionGesture();ignoreClickUntil=Date.now()+700}
- },430);
+  if(selectWordAt(touchGesture.x,touchGesture.y)){touchGesture.long=true;touchGesture.anchor={start:touchSelection.start,end:touchSelection.end};startSelectionGesture();try{$('viewport').setPointerCapture(touchGesture.id)}catch{}ignoreClickUntil=Date.now()+700}
+ },SELECTION_HOLD_MS);
 });
 $('viewport').addEventListener('pointermove',e=>{
  const g=touchGesture;if(!g||e.pointerId!==g.id)return;
@@ -800,24 +886,28 @@ $('viewport').addEventListener('pointermove',e=>{
    }
   }return;
  }
- if(e.cancelable)e.preventDefault();queueSelectionPoint(e.clientX,e.clientY,'extend',g.anchor);
+ if(e.cancelable)e.preventDefault();dragTouchSelectionTo(e.clientX,e.clientY);
 });
 $('viewport').addEventListener('touchstart',e=>{
- if(e.touches.length>1){cancelHold();stopSelectionGesture();if(touchGesture?.brightness)finishBrightness();touchGesture=null;hideSelection()}
+ if(e.touches.length>1){cancelHold();finishTouchSelection(null,null,true);stopSelectionGesture();if(touchGesture?.brightness)finishBrightness();touchGesture=null;hideSelection()}else if(touchGesture)touchGesture.touchActive=true;
 },{passive:true});
+$('viewport').addEventListener('touchend',e=>{const t=e.changedTouches[0];finishTouchSelection(t?.clientX,t?.clientY)});
+$('viewport').addEventListener('touchcancel',()=>finishTouchSelection(null,null,true));
 $('viewport').addEventListener('pointercancel',()=>{
+ if(touchGesture?.long&&touchGesture.touchActive)return;
+ if(touchGesture?.long){finishTouchSelection(null,null,true);return}
  cancelHold();stopSelectionGesture();if(touchGesture?.brightness)finishBrightness();
  pendingSelectionPoint=null;cancelAnimationFrame(selectionFrame);selectionFrame=0;touchGesture=null;
 });
 $('viewport').addEventListener('pointerup',async e=>{
  cancelHold();stopSelectionGesture();const g=touchGesture;if(!g||e.pointerId!==g.id)return;
  if(g.brightness){g.currentX=e.clientX;finishBrightness();touchGesture=null;ignoreClickUntil=Date.now()+500;return}
- if(g.long){flushSelectionPoint();if(g.hapticOnRelease&&touchSelection)selectionHaptic();touchGesture=null;ignoreClickUntil=Date.now()+500;return}
+ if(g.long){finishTouchSelection(e.clientX,e.clientY);return}
  touchGesture=null;const dx=e.clientX-g.x,dy=e.clientY-g.y;
  if(!settings.swipeBrightness&&settings.mode==='pages'&&Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.6&&e.pointerType==='touch'&&!g.hadSelection&&!getSelected()){
   ignoreClickUntil=Date.now()+400;await turn(dx<0?1:-1);return;
  }
- if(Math.abs(dx)<8&&Math.abs(dy)<8&&Math.abs($('viewport').scrollTop-g.scroll)<5&&Date.now()-g.time<430){
+ if(Math.abs(dx)<8&&Math.abs(dy)<8&&Math.abs($('viewport').scrollTop-g.scroll)<5&&Date.now()-g.time<SELECTION_HOLD_MS){
   if(g.hadSelection&&touchSelection){hideSelection();ignoreClickUntil=Date.now()+350;return}
   if(!e.target.closest('a,mark')&&!getSelected())toggleChrome();
  }
@@ -840,20 +930,28 @@ $('copySelection').onclick=copySelectedText;$('selectParagraph').onclick=expandS
 $('closeSelection').onclick=()=>{getSelection()?.removeAllRanges();hideSelection();$('viewport').focus({preventScroll:true})};
 for(const [id,isEnd] of [['selectionStart',false],['selectionEnd',true]]){
  const handle=$(id);
- handle.addEventListener('pointerdown',e=>{
-  if(!touchSelection||e.isPrimary===false||e.button>0)return;e.preventDefault();cancelHold();handleDrag={id:e.pointerId,isEnd};
-  try{handle.setPointerCapture(e.pointerId)}catch{}
- });
- handle.addEventListener('pointermove',e=>{
-  if(!handleDrag||handleDrag.id!==e.pointerId||!touchSelection)return;e.preventDefault();
-  queueSelectionPoint(e.clientX,e.clientY-12,isEnd?'end':'start');
- });
- const finish=e=>{
-  if(handleDrag?.id!==e.pointerId)return;
-  if(e.type==='pointercancel'){pendingSelectionPoint=null;cancelAnimationFrame(selectionFrame);selectionFrame=0}else flushSelectionPoint();
-  handleDrag=null;ignoreClickUntil=Date.now()+350;if(handle.hasPointerCapture(e.pointerId))handle.releasePointerCapture(e.pointerId);
+ const start=(x,y,pointerId)=>{
+  if(!touchSelection)return;cancelHold();const r=selectionHandleGeometry.get(id),anchorX=r?(isEnd?r.right:r.left):x,anchorY=r?(r.top+r.bottom)/2:y-12;
+  handleDrag={id:pointerId,isEnd,offsetX:x-anchorX,offsetY:y-anchorY,touchActive:false,moved:false};prepareSelectionView(touchSelection.chapter);selectionDragStarted();
  };
- handle.addEventListener('pointerup',finish);handle.addEventListener('pointercancel',finish);handle.addEventListener('lostpointercapture',finish);
+ const move=(x,y)=>{const g=handleDrag;if(!g||!touchSelection)return;g.moved=true;g.x=x;g.y=y;queueSelectionPoint(x-g.offsetX,y-g.offsetY,isEnd?'end':'start')};
+ const finish=(x,y,cancelled=false)=>{
+  const g=handleDrag;if(!g)return;
+  if(cancelled){pendingSelectionPoint=null;cancelAnimationFrame(selectionFrame);selectionFrame=0}
+  else{if(g.moved&&Number.isFinite(x)&&Number.isFinite(y))move(x,y);flushSelectionPoint()}
+  handleDrag=null;ignoreClickUntil=Date.now()+350;selectionDragFinished();if(typeof g.id==='number'&&handle.hasPointerCapture(g.id))handle.releasePointerCapture(g.id);
+ };
+ handle.addEventListener('pointerdown',e=>{
+  if(!touchSelection||e.isPrimary===false||e.button>0)return;e.preventDefault();start(e.clientX,e.clientY,e.pointerId);try{handle.setPointerCapture(e.pointerId)}catch{}
+ });
+ handle.addEventListener('pointermove',e=>{if(handleDrag?.id!==e.pointerId)return;e.preventDefault();move(e.clientX,e.clientY)});
+ handle.addEventListener('pointerup',e=>{if(handleDrag?.id===e.pointerId)finish(e.clientX,e.clientY)});
+ handle.addEventListener('pointercancel',e=>{if(handleDrag?.id===e.pointerId&&!handleDrag.touchActive)finish(null,null,true)});
+ handle.addEventListener('lostpointercapture',()=>{if(handleDrag&&!handleDrag.touchActive)finish()});
+ handle.addEventListener('touchstart',e=>{if(e.touches.length!==1)return;const t=e.touches[0];if(!handleDrag)start(t.clientX,t.clientY,'touch');if(handleDrag)handleDrag.touchActive=true;if(e.cancelable)e.preventDefault()},{passive:false});
+ handle.addEventListener('touchmove',e=>{if(!handleDrag||e.touches.length!==1)return;if(e.cancelable)e.preventDefault();const t=e.touches[0];move(t.clientX,t.clientY)},{passive:false});
+ handle.addEventListener('touchend',e=>{if(!handleDrag)return;const t=e.changedTouches[0];finish(t?.clientX,t?.clientY)});
+ handle.addEventListener('touchcancel',()=>finish(null,null,true));
  handle.addEventListener('keydown',e=>{
   if(!touchSelection||!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();const step=e.key==='ArrowRight'?1:-1;
   selectTouchRange(touchSelection.chapter,isEnd?touchSelection.start:Math.min(touchSelection.end-1,touchSelection.start+step),isEnd?Math.max(touchSelection.start+1,touchSelection.end+step):touchSelection.end);
