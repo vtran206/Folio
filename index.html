@@ -50,6 +50,10 @@ button.primary{background:var(--button-bg);color:var(--button-ink)}button.primar
 [data-compact-note="true"] .note-dialog textarea{height:64px;min-height:60px}
 [data-compact-note="true"] .note-dialog .check-label{margin-top:8px;margin-bottom:6px;line-height:1.4}
 [data-compact-note="true"] .note-dialog-actions{padding-top:8px;padding-bottom:8px}
+/* Selection feedback is a small overlay; dimming never filters the book. */
+#readingDimmer{position:absolute;inset:0;z-index:9;background:#000;opacity:0;pointer-events:none}#readingDimmer.adjusting{will-change:opacity}
+#brightnessHud{position:absolute;top:max(88px,calc(env(safe-area-inset-top) + 72px));left:50%;transform:translateX(-50%);z-index:12;display:flex;align-items:center;gap:9px;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:22px;padding:10px 16px;font-size:12px;white-space:nowrap;pointer-events:none;box-shadow:0 4px 22px #0002}#brightnessHud strong{font-variant-numeric:tabular-nums}#brightnessHud>span{font-size:19px;line-height:1}
+.field-help{font-size:11px;color:var(--muted);line-height:1.6}.theme-toggle small{display:block;font-size:10px;font-weight:400;color:var(--muted);line-height:1.6;margin-top:4px}.theme-toggle input:disabled{opacity:.4}
 </style>
 </head>
 <body>
@@ -103,6 +107,7 @@ button.primary{background:var(--button-bg);color:var(--button-ink)}button.primar
   <div class="reader-content"><div class="read-viewport" id="viewport" tabindex="0" aria-label="Book text"><article id="bookText" class="book-text pages"></article></div></div>
   <button class="page-edge prev" id="prevPage" aria-label="Previous page"><svg class="icon"><use href="#i-left"/></svg></button><button class="page-edge next" id="nextPage" aria-label="Next page"><svg class="icon"><use href="#i-right"/></svg></button>
   <footer class="reader-bottom"><div class="row"><span class="location grow" id="locationLabel">Chapter 1</span><span class="location" id="pageLabel"></span><span class="percent" id="percentLabel">0%</span></div><input type="range" min="0" max="1000" value="0" id="bookProgress" aria-label="Book completion; drag to navigate"><div class="bottom-caption" id="saveStatus">Reading position saves automatically</div></footer>
+<div id="readingDimmer" aria-hidden="true"></div><div id="brightnessHud" hidden aria-hidden="true"><span aria-hidden="true">☀</span> Reading brightness <strong id="brightnessAmount">100%</strong></div>
 </main>
 <div id="selectionLayer" class="selection-layer" aria-hidden="true" hidden></div>
 <button class="selection-handle" id="selectionStart" aria-label="Adjust selection start; use left and right arrows" hidden></button>
@@ -118,7 +123,7 @@ button.primary{background:var(--button-bg);color:var(--button-ink)}button.primar
 <script>
 'use strict';
 const $=id=>document.getElementById(id), icon=n=>`<svg class="icon" aria-hidden="true"><use href="#i-${n}"/></svg>`, esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const defaults={font:'Georgia',size:20,leading:1.8,paper:'#fbf9f3',ink:'#28382e',mode:'pages',darkMode:false,nativeSelection:false};
+const defaults={font:'Georgia',size:20,leading:1.8,paper:'#fbf9f3',ink:'#28382e',mode:'pages',darkMode:false,nativeSelection:false,selectionHaptics:true,swipeBrightness:true,brightness:1};
 let settings={...defaults}, library=[],states=new Map(),active=null,contents=null,state=null,filter='all',page=0,pageCount=1,renderSeq=0,suppress=false,selection=null,editing=null,removeId=null,lastFocus=null,drawerKind='',assetUrls=new Map(),coverUrls=new Map(),zip=null,saveTimer,scrollTimer,toastTimer,layoutTimer,dragDepth=0;
 let chapterTextCache=new Map(),wordMatchCache=new Map(),nodeIndexCache=new WeakMap(),chapterStarts=[],bookLength=0,assetPromises=new Map(),nativeDeflate=null;
 let touchSelection=null,touchGesture=null,holdTimer=null,handleDrag=null,ignoreClickUntil=0,selectionFrame=0,locationFrame=0;
@@ -138,6 +143,7 @@ function loadSettings(){
  root.style.setProperty('--size',settings.size+'px');root.style.setProperty('--leading',settings.leading);
  $('themeColor').content=settings.darkMode?'#171e1b':'#f6f4ee';
  $('reader').classList.toggle('touch-selection',!settings.nativeSelection&&matchMedia('(any-pointer: coarse)').matches);
+ renderBrightness();
 }
 async function saveSettings(){try{await data('preferences','put',{id:'settings',value:settings})}catch{toast('Reading settings could not be saved.')}}
 /* Raw DEFLATE decoder: ZIPs can be opened offline, without a CDN or package. */
@@ -210,7 +216,7 @@ function matchesForChapter(chapter,word){
 function occurrenceCount(word){return contents.chapters.reduce((n,c,i)=>n+matchesForChapter(i,word).length,0)}
 function scrollToPosition(pos){const vp=$('viewport'),sec=$('bookText').querySelector(`section[data-chapter="${pos.chapter}"]`);if(!sec)return;const r=rangeAt(sec,Math.min(pos.offset,contents.chapters[pos.chapter].length-1));let rect=r?.getClientRects()[0];if(!rect||(!rect.width&&!rect.height))rect=sec.getBoundingClientRect();const box=vp.getBoundingClientRect();if(settings.mode==='pages'){const target=rect.left-box.left+vp.scrollLeft;page=Math.max(0,Math.min(pageCount-1,Math.floor((target+2)/stride())));vp.scrollLeft=page*stride()}else vp.scrollTop=Math.max(0,rect.top-box.top+vp.scrollTop-7)}
 async function gotoPosition(pos){if(!active)return;pos.chapter=Math.max(0,Math.min(contents.chapters.length-1,pos.chapter));pos.offset=Math.max(0,pos.offset||0);const rebuild=settings.mode==='pages'&&+$('bookText').querySelector('section.chapter')?.dataset.chapter!==pos.chapter;state.position=pos;await layout(pos,rebuild)}
-async function closeBook(){if(!active)return;clearTimeout(saveTimer);updateLocation(false);await persist();closeDrawer();hideSelection();$('reader').hidden=true;$('library').hidden=false;document.body.style.overflow='';active=null;contents=null;state=null;zip=null;renderSeq++;suppress=false;$('bookText').innerHTML='';releaseAssets();renderLibrary()}
+async function closeBook(){if(!active)return;cancelHold();stopSelectionGesture();if(touchGesture?.brightness)finishBrightness();touchGesture=null;handleDrag=null;$('brightnessHud').hidden=true;clearTimeout(saveTimer);updateLocation(false);await persist();closeDrawer();hideSelection();$('reader').hidden=true;$('library').hidden=false;document.body.style.overflow='';active=null;contents=null;state=null;zip=null;renderSeq++;suppress=false;$('bookText').innerHTML='';releaseAssets();renderLibrary()}
 async function turn(direction){if(!active||suppress)return;hideSelection();getSelection()?.removeAllRanges();updatePages();const chapter=state.position.chapter;if(settings.mode==='scroll'){$('viewport').scrollBy({top:direction*$('viewport').clientHeight*.85,behavior:'smooth'});return}if(direction>0&&page<pageCount-1){$('viewport').scrollLeft=(page+1)*stride();updateLocation()}else if(direction<0&&page>0){$('viewport').scrollLeft=(page-1)*stride();updateLocation()}else if(direction>0&&chapter<contents.chapters.length-1)await gotoPosition({chapter:chapter+1,offset:0});else if(direction<0&&chapter>0){await gotoPosition({chapter:chapter-1,offset:contents.chapters[chapter-1].length-1})}}
 function toggleChrome(force){
  const hidden=force===undefined?!$('reader').classList.contains('focus-mode'):!force;
@@ -218,7 +224,7 @@ function toggleChrome(force){
  if(hidden&&document.activeElement?.closest('.reader-top,.reader-bottom'))$('viewport').focus({preventScroll:true});
 }
 function drawerHeader(title,description=''){return`<div class="drawer-header"><h2 id="drawerTitle">${title}</h2><button class="icon-btn" data-close-drawer aria-label="Close panel">${icon('x')}</button></div>${description?`<p class="intro">${description}</p>`:''}`}
-function showDrawer(kind){clearTimeout(toastTimer);$('toast').hidden=true;updateLocation(false);hideSelection();if($('drawerOverlay').hidden)lastFocus=document.activeElement;drawerKind=kind;$('drawerOverlay').hidden=false;let html='';if(kind==='toc'){html=drawerHeader('The chapters.',esc(active.title))+`<div class="toc-list">`+contents.toc.map((t,i)=>`<button class="toc-item ${t.chapter===state.position.chapter?'active':''}" data-toc="${i}" style="padding-left:${12+Math.min(t.depth,4)*14}px"><span class="num">${String(i+1).padStart(2,'0')}</span><span>${esc(t.label)}</span>${t.chapter===state.position.chapter?'<span class="dot"></span>':''}</button>`).join('')+'</div>'}else if(kind==='settings'){html=drawerHeader('Make it yours.','A comfortable page makes room for a good story.')+`<div class="field"><label class="theme-toggle" for="darkModeToggle"><span>Dark mode<small>Darkens Folio, settings, notes, and the reading page.</small></span><input class="switch" type="checkbox" role="switch" id="darkModeToggle" ${settings.darkMode?'checked':''}></label></div><hr class="setting-rule"><div class="field"><span class="label">Reading mode</span><div class="segmented"><button data-mode="pages" class="${settings.mode==='pages'?'active':''}">${icon('book')}Pages</button><button data-mode="scroll" class="${settings.mode==='scroll'?'active':''}">${icon('scroll')}Infinite scroll</button></div></div><div class="field"><label for="fontSelect">Typeface</label><select id="fontSelect"><option value="Georgia">Georgia · classic serif</option><option value="Palatino">Palatino · literary serif</option><option value="System">System · clean sans serif</option><option value="Mono">Monospace · evenly spaced</option></select></div><div class="field"><label for="fontSize">Text size <span id="fontSizeValue">${settings.size}px</span></label><div class="row"><button class="size-step" data-size="-1" aria-label="Smaller text">A−</button><input id="fontSize" type="range" min="14" max="36" value="${settings.size}"><button class="size-step" data-size="1" aria-label="Larger text">A+</button></div></div><div class="field"><label for="lineSpacing">Line spacing <span id="lineValue">${settings.leading.toFixed(1)}</span></label><input id="lineSpacing" type="range" min="1.3" max="2.5" step="0.1" value="${settings.leading}"></div><hr class="setting-rule"><div class="field"><span class="label">Page mood</span><div class="themes">${[{name:'Paper',paper:'#fbf9f3',ink:'#28382e'},{name:'Sepia',paper:'#eee1c9',ink:'#594330'},{name:'Night',paper:'#202b27',ink:'#d9ded3'}].map(t=>`<button class="theme ${settings.paper===t.paper?'active':''}" data-paper="${t.paper}" data-ink="${t.ink}" style="background:${t.paper};color:${t.ink}">Aa<span>${t.name}</span></button>`).join('')}</div></div><div class="colors"><label><input type="color" id="paperColor" value="${settings.paper}">Background</label><label><input type="color" id="inkColor" value="${settings.ink}">Text color</label></div><hr class="setting-rule"><div class="field"><label for="selectionMode">Text selection menu</label><select id="selectionMode"><option value="folio">Folio · Copy and notes together</option><option value="browser">Browser · native text selection</option></select><p class="field-help">Folio: hold a word, then drag its handles to adjust. Browser: keeps Look Up and other native actions; Folio's note buttons stay at the bottom.</p></div><button class="subtle small" id="resetSettings">Restore defaults</button><p class="keyboard-tip">← → turn pages · F hides controls<br>Esc closes a panel · Your preferences save automatically.</p>`}else{html=drawerHeader('In the margins.','Select a word in the book to leave a thought. A global note follows that word through every chapter.')+`<div class="note-stats">${state.notes.length} ${state.notes.length===1?'note':'notes'} in this book</div>`+(state.notes.length?state.notes.map(n=>`<article class="note-card"><div class="row between"><span class="note-word">${esc(n.word)}</span><span class="pill" ${n.global?'data-note-count="'+esc(n.id)+'"':''}>${n.global?'Global':'This occurrence'}</span></div><p>${esc(n.text)}</p><div class="row"><button class="subtle" data-locate-note="${esc(n.id)}">Go to word ${icon('arrow')}</button><span class="grow"></span><button class="icon-btn" data-edit-note="${esc(n.id)}" aria-label="Edit note on ${esc(n.word)}">${icon('note')}</button></div></article>`).join(''):`<div class="notes-empty">The best thoughts often happen<br>between the lines.<br><br>Select a word to add your first note.</div>`)}$('drawer').innerHTML=html;if(kind==='settings'){$('fontSelect').value=settings.font;$('selectionMode').value=settings.nativeSelection?'browser':'folio'}$('drawer').focus({preventScroll:true});fillNoteCounts()}
+function showDrawer(kind){clearTimeout(toastTimer);$('toast').hidden=true;updateLocation(false);hideSelection();if($('drawerOverlay').hidden)lastFocus=document.activeElement;drawerKind=kind;$('drawerOverlay').hidden=false;let html='';if(kind==='toc'){html=drawerHeader('The chapters.',esc(active.title))+`<div class="toc-list">`+contents.toc.map((t,i)=>`<button class="toc-item ${t.chapter===state.position.chapter?'active':''}" data-toc="${i}" style="padding-left:${12+Math.min(t.depth,4)*14}px"><span class="num">${String(i+1).padStart(2,'0')}</span><span>${esc(t.label)}</span>${t.chapter===state.position.chapter?'<span class="dot"></span>':''}</button>`).join('')+'</div>'}else if(kind==='settings'){html=drawerHeader('Make it yours.','A comfortable page makes room for a good story.')+`<div class="field"><label class="theme-toggle" for="darkModeToggle"><span>Dark mode<small>Darkens Folio, settings, notes, and the reading page.</small></span><input class="switch" type="checkbox" role="switch" id="darkModeToggle" ${settings.darkMode?'checked':''}></label></div><hr class="setting-rule"><div class="field"><span class="label">Reading mode</span><div class="segmented"><button data-mode="pages" class="${settings.mode==='pages'?'active':''}">${icon('book')}Pages</button><button data-mode="scroll" class="${settings.mode==='scroll'?'active':''}">${icon('scroll')}Infinite scroll</button></div></div><div class="field"><label for="fontSelect">Typeface</label><select id="fontSelect"><option value="Georgia">Georgia · classic serif</option><option value="Palatino">Palatino · literary serif</option><option value="System">System · clean sans serif</option><option value="Mono">Monospace · evenly spaced</option></select></div><div class="field"><label for="fontSize">Text size <span id="fontSizeValue">${settings.size}px</span></label><div class="row"><button class="size-step" data-size="-1" aria-label="Smaller text">A−</button><input id="fontSize" type="range" min="14" max="36" value="${settings.size}"><button class="size-step" data-size="1" aria-label="Larger text">A+</button></div></div><div class="field"><label for="lineSpacing">Line spacing <span id="lineValue">${settings.leading.toFixed(1)}</span></label><input id="lineSpacing" type="range" min="1.3" max="2.5" step="0.1" value="${settings.leading}"></div><hr class="setting-rule"><div class="field"><span class="label">Page mood</span><div class="themes">${[{name:'Paper',paper:'#fbf9f3',ink:'#28382e'},{name:'Sepia',paper:'#eee1c9',ink:'#594330'},{name:'Night',paper:'#202b27',ink:'#d9ded3'}].map(t=>`<button class="theme ${settings.paper===t.paper?'active':''}" data-paper="${t.paper}" data-ink="${t.ink}" style="background:${t.paper};color:${t.ink}">Aa<span>${t.name}</span></button>`).join('')}</div></div><div class="colors"><label><input type="color" id="paperColor" value="${settings.paper}">Background</label><label><input type="color" id="inkColor" value="${settings.ink}">Text color</label></div><hr class="setting-rule"><div class="field"><label for="selectionMode">Text selection menu</label><select id="selectionMode"><option value="folio">Folio · Copy and notes together</option><option value="browser">Browser · native text selection</option></select><p class="field-help">Folio: hold a word, then drag its handles to adjust. Browser: keeps Look Up and other native actions; Folio's note buttons stay at the bottom.</p></div><hr class="setting-rule"><div class="field"><label for="readingBrightness">Reading brightness <span id="brightnessValue">${Math.round(settings.brightness*100)}%</span></label><input id="readingBrightness" type="range" min="20" max="100" step="1" value="${Math.round(settings.brightness*100)}"><p class="field-help">Dims the reading page within Folio. Your phone’s display brightness is controlled in Control Center.</p></div><div class="field"><label class="theme-toggle" for="brightnessSwipe"><span>Swipe to adjust brightness<small>Drag right to brighten, left to dim. Use the arrow buttons to turn pages. Turn this off to swipe between pages.</small></span><input class="switch" type="checkbox" role="switch" id="brightnessSwipe" ${settings.swipeBrightness?'checked':''}></label></div><div class="field"><label class="theme-toggle" for="selectionHaptics"><span>Selection haptics<small>${typeof navigator.vibrate==='function'?'A brief vibration when a word is selected, if your device allows it.':'Selection vibration is unavailable in this browser. iPhone Safari does not provide it to websites.'}</small></span><input class="switch" type="checkbox" role="switch" id="selectionHaptics" ${settings.selectionHaptics&&typeof navigator.vibrate==='function'?'checked':''} ${typeof navigator.vibrate==='function'?'':'disabled'}></label></div><button class="subtle small" id="resetSettings">Restore defaults</button><p class="keyboard-tip">← → turn pages · F hides controls<br>Esc closes a panel · Your preferences save automatically.</p>`}else{html=drawerHeader('In the margins.','Select a word in the book to leave a thought. A global note follows that word through every chapter.')+`<div class="note-stats">${state.notes.length} ${state.notes.length===1?'note':'notes'} in this book</div>`+(state.notes.length?state.notes.map(n=>`<article class="note-card"><div class="row between"><span class="note-word">${esc(n.word)}</span><span class="pill" ${n.global?'data-note-count="'+esc(n.id)+'"':''}>${n.global?'Global':'This occurrence'}</span></div><p>${esc(n.text)}</p><div class="row"><button class="subtle" data-locate-note="${esc(n.id)}">Go to word ${icon('arrow')}</button><span class="grow"></span><button class="icon-btn" data-edit-note="${esc(n.id)}" aria-label="Edit note on ${esc(n.word)}">${icon('note')}</button></div></article>`).join(''):`<div class="notes-empty">The best thoughts often happen<br>between the lines.<br><br>Select a word to add your first note.</div>`)}$('drawer').innerHTML=html;if(kind==='settings'){$('fontSelect').value=settings.font;$('selectionMode').value=settings.nativeSelection?'browser':'folio'}$('drawer').focus({preventScroll:true});fillNoteCounts()}
 function getSelected(){
  if(!active||!$('noteOverlay').hidden||!$('drawerOverlay').hidden)return null;
  if(touchSelection)return touchSelection;
@@ -244,69 +250,133 @@ function showSelectionTools(picked){
 }
 function selectionChanged(){
  const picked=getSelected();if(!picked){hideSelection();return}
- if(touchSelection)return;showSelectionTools(picked);
+ if(touchSelection)return;const first=!selection;showSelectionTools(picked);if(first)selectionHaptic();
 }
+// Native caret hit testing is fast where available. Safari may return no caret
+// for user-select:none, so the fallback searches source offsets logarithmically.
+// It never walks a paragraph character by character or toggles overlay styles.
 function caretAtPoint(x,y){
- const floating=[$('selectionStart'),$('selectionEnd'),$('selectionTools'),document.querySelector('.reader-top'),document.querySelector('.reader-bottom')];
- floating.forEach(el=>el.style.pointerEvents='none');let node,offset;
+ let node,offset;
  try{
   if(document.caretPositionFromPoint){const p=document.caretPositionFromPoint(x,y);if(p){node=p.offsetNode;offset=p.offset}}
   if(!sectionOf(node)&&document.caretRangeFromPoint){const r=document.caretRangeFromPoint(x,y);if(r){node=r.startContainer;offset=r.startOffset}}
-  const sec=sectionOf(node);
-  if(sec&&$('bookText').contains(sec))return{chapter:+sec.dataset.chapter,offset:offsetAt(sec,node,offset)};
-  // Some WebKit versions do not expose a caret inside user-select:none. Hit-test
-  // the touched paragraph instead; this work runs only for a selection gesture.
-  const el=document.elementsFromPoint(x,y).find(el=>$('bookText').contains(el)&&el!==$('bookText'));
-  if(!el)return null;const parent=sectionOf(el);if(!parent)return null;
-  let nearest=null,best=Infinity;
-  for(const t of textNodes(el)){
-   const r=document.createRange();r.selectNodeContents(t.node);
-   if(![...r.getClientRects()].some(b=>y>=b.top-5&&y<=b.bottom+5&&x>=b.left-20&&x<=b.right+20))continue;
-   for(let i=0;i<t.node.length;i++){
-    r.setStart(t.node,i);r.setEnd(t.node,i+1);const b=r.getBoundingClientRect();
-    if(!b.height)continue;const distance=Math.max(b.top-y,0,y-b.bottom)*3+Math.max(b.left-x,0,x-b.right);
-    if(distance<best){best=distance;nearest={chapter:+parent.dataset.chapter,offset:offsetAt(parent,t.node,i)}}
-    if(distance===0)return nearest;
-   }
-  }return best<35?nearest:null;
- }finally{floating.forEach(el=>el.style.pointerEvents='')}
+ }catch{}
+ const sec=sectionOf(node);
+ if(sec&&$('bookText').contains(sec))return{chapter:+sec.dataset.chapter,offset:offsetAt(sec,node,offset)};
+ const hit=document.elementsFromPoint(x,y).find(el=>$('bookText').contains(el)&&el!==$('bookText'));
+ if(!hit)return null;
+ const root=hit.closest('p,li,h1,h2,h3,h4,h5,h6,blockquote,pre,td,th,figcaption')||hit;
+ const parent=sectionOf(root);if(!parent)return null;
+ const list=textNodes(root),length=list.length?list[list.length-1].end:0;if(!length)return null;
+ const vp=$('viewport'),box=vp.getBoundingClientRect(),step=stride();
+ const key=[renderSeq,contentEpoch,vp.scrollTop,vp.scrollLeft,vp.clientWidth,vp.clientHeight].join(':');
+ let metrics=caretHitCache.get(root);if(!metrics||metrics.key!==key){metrics={key,rects:new Map(),lines:[]};caretHitCache.set(root,metrics)}
+ const cache=metrics.rects;if(cache.size>4096)cache.clear();
+ const targetColumn=settings.mode==='pages'?Math.floor((x-box.left+$('viewport').scrollLeft)/step):0;
+ const column=r=>settings.mode==='pages'?Math.floor((r.left-box.left+$('viewport').scrollLeft+1)/step):0;
+ const rectAt=at=>{if(!cache.has(at))cache.set(at,charRectAt(root,at));return cache.get(at)};
+ const lower=(start,end,predicate)=>{let lo=start,hi=end;while(lo<hi){const mid=(lo+hi)>>1,r=rectAt(mid);if(r&&predicate(r))lo=mid+1;else hi=mid}return lo};
+ let known=metrics.lines.find(line=>line.column===targetColumn&&y>=line.top&&y<=line.bottom),start,end,at;
+ if(known){({start,end}=known);at=start}
+ else{
+  at=Math.min(length-1,lower(0,length,r=>column(r)<targetColumn||column(r)===targetColumn&&r.bottom<y));let line=rectAt(at);if(!line)return null;
+  if(at>0&&line.top>y){const previous=rectAt(at-1);if(previous&&column(previous)===targetColumn&&y-previous.bottom<line.top-y){at--;line=previous}}
+  if(column(line)!==targetColumn||Math.max(line.top-y,0,y-line.bottom)>35)return null;
+  const midY=(line.top+line.bottom)/2;
+  start=lower(0,at,r=>column(r)<targetColumn||column(r)===targetColumn&&r.bottom<=midY);
+  end=lower(at+1,length,r=>column(r)<targetColumn||column(r)===targetColumn&&r.top<midY);
+  metrics.lines.push({start,end,top:line.top,bottom:line.bottom,column:targetColumn});
+ }
+ let best=Infinity,nearest=at;
+ const consider=i=>{const r=rectAt(i);if(!r||column(r)!==targetColumn)return;const distance=Math.max(r.top-y,0,y-r.bottom)*3+Math.max(r.left-x,0,x-r.right);if(distance<best){best=distance;nearest=i}};
+ if(end-start<=64){for(let i=start;i<end;i++)consider(i)}
+ else{
+  const rtl=getComputedStyle(root).direction==='rtl';
+  const near=lower(start,end,r=>rtl?r.left>x:r.right<x);
+  for(let i=Math.max(start,near-4);i<Math.min(end,near+5);i++)consider(i);
+ }
+ if(best>35)return null;
+ const point=pointAt(root,nearest);return point?{chapter:+parent.dataset.chapter,offset:offsetAt(parent,point.node,point.offset)}:null;
 }
+let selectionSegmenter=null,segmenterLanguage='',lastWordBounds=null,pendingSelectionPoint=null,caretHitCache=new WeakMap();
 function wordBounds(chapter,offset){
  const text=plainText(chapter);if(!text.length)return null;let p=Math.max(0,Math.min(text.length-1,offset));
  if(!isLetter(text[p])&&p>0&&isLetter(text[p-1]))p--;
- if(typeof Intl.Segmenter==='function'){
-  try{const segment=new Intl.Segmenter(active.language||'en',{granularity:'word'}).segment(text).containing(p);
-   if(segment?.isWordLike)return{start:segment.index,end:segment.index+segment.segment.length};
-  }catch{}
- }
+ if(lastWordBounds?.text===text&&p>=lastWordBounds.start&&p<lastWordBounds.end)return{start:lastWordBounds.start,end:lastWordBounds.end};
+ // Segment a small neighborhood, not the entire chapter, on each handle move.
+ if(typeof Intl.Segmenter==='function')try{
+  const language=active.language||'en';if(!selectionSegmenter||segmenterLanguage!==language){selectionSegmenter=new Intl.Segmenter(language,{granularity:'word'});segmenterLanguage=language}
+  const base=Math.max(0,p-256),segment=selectionSegmenter.segment(text.slice(base,p+257)).containing(p-base);
+  if(segment?.isWordLike&&segment.index>0&&segment.index+segment.segment.length<Math.min(text.length-base,p+257-base)){
+   const bounds={start:base+segment.index,end:base+segment.index+segment.segment.length};lastWordBounds={...bounds,text};return bounds;
+  }
+ }catch{}
  const isPart=c=>!!c&&/[\p{L}\p{N}\p{M}_'’\-]/u.test(c);if(!isPart(text[p]))return null;
  let start=p,end=p+1;while(start>0&&isPart(text[start-1]))start--;while(end<text.length&&isPart(text[end]))end++;
- return{start,end};
+ lastWordBounds={text,start,end};return{start,end};
 }
 function selectTouchRange(chapter,start,end){
- const sec=$('bookText').querySelector(`section[data-chapter="${chapter}"]`);if(!sec)return false;
- const text=plainText(chapter);start=Math.max(0,Math.min(text.length-1,start));end=Math.max(start+1,Math.min(text.length,end));
- const range=rangeAt(sec,start,end);if(!range)return false;
- touchSelection={chapter,start,end,word:text.slice(start,end),custom:true,rect:range.getBoundingClientRect()};
- getSelection()?.removeAllRanges();selection=touchSelection;paintTouchSelection();showSelectionTools(touchSelection);return true;
+ const sec=chapterElements.find(el=>+el.dataset.chapter===chapter);if(!sec)return false;
+ const text=plainText(chapter);if(!text.length)return false;start=Math.max(0,Math.min(text.length-1,start));end=Math.max(start+1,Math.min(text.length,end));
+ if(touchSelection?.chapter===chapter&&touchSelection.start===start&&touchSelection.end===end)return true;
+ const first=!touchSelection;
+ touchSelection={chapter,start,end,word:text.slice(start,end),custom:true};selection=touchSelection;
+ if(first)getSelection()?.removeAllRanges();
+ // Read all text geometry before writing the highlight and toolbar DOM.
+ paintTouchSelection();showSelectionTools(touchSelection);return true;
+}
+function selectionHaptic(){
+ if(!settings.selectionHaptics||typeof navigator.vibrate!=='function')return true;
+ try{return navigator.vibrate(10)!==false}catch{return true}
 }
 function selectWordAt(x,y){
  const point=caretAtPoint(x,y);if(!point)return false;const word=wordBounds(point.chapter,point.offset);if(!word)return false;
- toggleChrome(false);return selectTouchRange(point.chapter,word.start,word.end);
+ toggleChrome(false);const selected=selectTouchRange(point.chapter,word.start,word.end);
+ if(selected&&touchGesture)touchGesture.hapticOnRelease=!selectionHaptic();else if(selected)selectionHaptic();return selected;
 }
 function paintTouchSelection(){
- if(!touchSelection||!active)return;const sec=$('bookText').querySelector(`section[data-chapter="${touchSelection.chapter}"]`);
- const range=sec&&rangeAt(sec,touchSelection.start,touchSelection.end);if(!range)return;
- const box=$('viewport').getBoundingClientRect(),rects=[...range.getClientRects()].filter(r=>r.width&&r.height&&r.right>box.left&&r.left<box.right&&r.bottom>box.top&&r.top<box.bottom);
- const fragment=document.createDocumentFragment();for(const r of rects){const mark=document.createElement('div');mark.className='selection-rect';
-  const left=Math.max(box.left,r.left),top=Math.max(box.top,r.top);Object.assign(mark.style,{left:left+'px',top:top+'px',width:(Math.min(box.right,r.right)-left)+'px',height:(Math.min(box.bottom,r.bottom)-top)+'px'});fragment.append(mark)}
- $('selectionLayer').replaceChildren(fragment);$('selectionLayer').hidden=!rects.length;
- for(const [id,offset,isEnd] of [['selectionStart',touchSelection.start,false],['selectionEnd',touchSelection.end,true]]){
-  const r=rangeAt(sec,isEnd?Math.max(touchSelection.start,offset-1):offset,isEnd?offset:offset+1),rect=r?.getClientRects()[isEnd?r.getClientRects().length-1:0],handle=$(id);
-  const visible=rect&&rect.bottom>box.top&&rect.bottom<box.bottom&&rect.left>=box.left-1&&rect.right<=box.right+1;
-  handle.hidden=!visible;if(visible){handle.style.left=((isEnd?rect.right:rect.left)-15)+'px';handle.style.top=(rect.bottom-3)+'px'}
+ if(!touchSelection||!active)return;const sec=chapterElements.find(el=>+el.dataset.chapter===touchSelection.chapter);if(!sec)return;
+ const box=$('viewport').getBoundingClientRect();let {start,end}=touchSelection;
+ // A chapter-wide Copy selection can contain millions of characters. Measure
+ // only its visible slice; the complete source selection remains unchanged.
+ if(end-start>1200){
+  const lower=(lo,hi,test)=>{while(lo<hi){const mid=(lo+hi)>>1,r=charRectAt(sec,mid);if(r&&test(r))lo=mid+1;else hi=mid}return lo};
+  const before=r=>settings.mode==='pages'?r.right<=box.left||r.left<box.right&&r.bottom<=box.top:r.bottom<=box.top;
+  const inside=r=>settings.mode==='pages'?r.right<=box.left||r.left<box.right&&r.top<box.bottom:r.top<box.bottom;
+  start=lower(start,end,before);end=lower(start,end,inside);
  }
+ const range=start<end?rangeAt(sec,start,end):null,rects=range?[...range.getClientRects()].filter(r=>r.width&&r.height&&r.right>box.left&&r.left<box.right&&r.bottom>box.top&&r.top<box.bottom):[];
+ rects.sort((a,b)=>Math.abs(a.top-b.top)>2?a.top-b.top:a.left-b.left);
+ const lines=[];
+ for(const r of rects){
+  const b={left:Math.max(box.left,r.left),right:Math.min(box.right,r.right),top:Math.max(box.top,r.top),bottom:Math.min(box.bottom,r.bottom)},last=lines[lines.length-1];
+  if(last&&Math.abs(last.top-b.top)<2&&Math.abs(last.bottom-b.bottom)<3&&b.left<=last.right+3)last.right=Math.max(last.right,b.right);else lines.push(b);
+ }
+ const handles=[['selectionStart',touchSelection.start,false],['selectionEnd',touchSelection.end,true]].map(([id,offset,isEnd])=>{
+  const r=rangeAt(sec,isEnd?Math.max(touchSelection.start,offset-1):offset,isEnd?offset:offset+1),rs=r?.getClientRects(),rect=rs?.[isEnd?rs.length-1:0];
+  return{id,rect,isEnd,visible:rect&&rect.bottom>box.top&&rect.bottom<box.bottom&&rect.left>=box.left-1&&rect.right<=box.right+1};
+ });
+ const layer=$('selectionLayer');
+ // Reuse rectangles while dragging. Never touch the book's text DOM.
+ while(layer.children.length<lines.length){const el=document.createElement('div');el.className='selection-rect';layer.append(el)}
+ [...layer.children].forEach((mark,i)=>{mark.hidden=i>=lines.length;if(i<lines.length){const r=lines[i];Object.assign(mark.style,{left:r.left+'px',top:r.top+'px',width:r.right-r.left+'px',height:r.bottom-r.top+'px'})}});
+ layer.hidden=!lines.length;
+ for(const {id,rect,isEnd,visible} of handles){const handle=$(id);handle.hidden=!visible;if(visible){handle.style.left=((isEnd?rect.right:rect.left)-15)+'px';handle.style.top=rect.bottom-3+'px'}}
 }
+function queueSelectionPoint(x,y,edge,anchor){
+ pendingSelectionPoint={x,y,edge,anchor};if(selectionFrame)return;
+ selectionFrame=requestAnimationFrame(flushSelectionPoint);
+}
+function flushSelectionPoint(){
+ cancelAnimationFrame(selectionFrame);selectionFrame=0;const pending=pendingSelectionPoint;pendingSelectionPoint=null;
+ if(!pending||!touchSelection||!active)return;
+ const point=caretAtPoint(pending.x,pending.y);if(!point||point.chapter!==touchSelection.chapter)return;
+ const bounds=wordBounds(point.chapter,point.offset);if(!bounds)return;
+ const start=pending.edge==='end'?touchSelection.start:pending.edge==='start'?Math.min(bounds.start,touchSelection.end-1):Math.min(pending.anchor.start,bounds.start);
+ const end=pending.edge==='start'?touchSelection.end:pending.edge==='end'?Math.max(bounds.end,touchSelection.start+1):Math.max(pending.anchor.end,bounds.end);
+ selectTouchRange(point.chapter,start,end);
+}
+
 function expandSelection(){
  const picked=getSelected()||selection;if(!picked)return;const text=plainText(picked.chapter);
  hideSelection();selectTouchRange(picked.chapter,0,text.length);toast('Chapter selected. Tap Copy to copy its text.');
@@ -436,6 +506,7 @@ function plainText(chapter){
 }
 function annotate(roots=chapterElements){
  if(!state)return;
+ nodeIndexCache=new WeakMap();caretHitCache=new WeakMap();
  for(const sec of roots){
   sec.querySelectorAll('mark[data-notes]').forEach(m=>m.replaceWith(...m.childNodes));sec.normalize();nodeIndexCache.delete(sec);
   const text=sec.textContent,chapter=+sec.dataset.chapter,events=[],ends=new Set();chapterTextCache.set(chapter,text);
@@ -495,7 +566,7 @@ function pumpImages(){
    await new Promise(resolve=>{im.onload=()=>resolve(true);im.onerror=()=>resolve(false);im.src=src;if(im.complete)resolve(true)});
    if(!im.isConnected||active?.id!==id)return;im.dataset.hydrated='true';
    if(im.naturalWidth&&im.naturalHeight){state.imageSizes||={};state.imageSizes[im.dataset.asset]={width:im.naturalWidth,height:im.naturalHeight};im.style.minHeight='';im.style.aspectRatio=im.naturalWidth+' / '+im.naturalHeight;queueSave();
-    pageMetricsDirty=true;if(settings.mode==='pages')scheduleImageLayout();
+    caretHitCache=new WeakMap();pageMetricsDirty=true;if(settings.mode==='pages')scheduleImageLayout();
    }
   }catch{im.alt=im.alt||'Illustration unavailable'}finally{imageJobs--;pumpImages()}})();
  }
@@ -525,7 +596,7 @@ async function openBook(id){
  $('busyTitle').textContent='Opening your book…';$('busyDetail').textContent=meta.title;$('busy').hidden=false;
  try{if(active)await persist();const c=contentCache.get(id)||await data('contents','get',id);if(!c)throw Error('The book data is missing. Please import this book again.');
   releaseAssets();active=meta;const {archive,...light}=c;contents=light;archiveBuffer=archive||null;if(!archive)cacheContent(light);
-  chapterTextCache.clear();wordMatchCache.clear();noteCountCache.clear();nodeIndexCache=new WeakMap();chapterStarts=[];bookLength=0;
+  lastWordBounds=null;chapterTextCache.clear();wordMatchCache.clear();noteCountCache.clear();nodeIndexCache=new WeakMap();chapterStarts=[];bookLength=0;
   for(const ch of light.chapters){chapterStarts.push(bookLength);bookLength+=ch.length}
   state=structuredClone(bookState(id));state.lastOpened=Date.now();states.set(id,state);$('readerTitle').textContent=meta.title;
   $('library').hidden=true;$('reader').hidden=false;$('reader').classList.remove('focus-mode');document.body.style.overflow='hidden';
@@ -537,6 +608,7 @@ async function openBook(id){
 }
 function releaseAssets(){stopImageWork();zipPromise=null;zip=null;archiveBuffer=null;assetPromises.clear();for(const url of assetUrls.values())URL.revokeObjectURL(url);assetUrls.clear()}
 function hideSelection(){
+ pendingSelectionPoint=null;cancelAnimationFrame(selectionFrame);selectionFrame=0;selection=null;
  if($('selectionTools').hidden&&!touchSelection&&$('selectionLayer').hidden)return;
  $('selectionTools').hidden=true;touchSelection=null;$('selectionLayer').hidden=true;$('selectionLayer').replaceChildren();$('selectionStart').hidden=true;$('selectionEnd').hidden=true;
 }
@@ -673,38 +745,76 @@ function scheduleLocation(){
  if(locationFrame||suppress)return;
  locationFrame=requestAnimationFrame(()=>{locationFrame=0;updateLocation()});
 }
+let brightnessFrame=0,brightnessTimer=0,brightnessSaveTimer=0;
+function renderBrightness(){
+ const value=Math.max(.2,Math.min(1,Number(settings.brightness)||1));settings.brightness=value;
+ // A viewport-sized opacity layer avoids filtering/repainting a whole book.
+ $('readingDimmer').style.opacity=String(1-value);
+ if($('readingBrightness'))$('readingBrightness').value=String(Math.round(value*100));
+ if($('brightnessValue'))$('brightnessValue').textContent=Math.round(value*100)+'%';
+ $('brightnessAmount').textContent=Math.round(value*100)+'%';
+}
+function setReadingBrightness(value,show=false){
+ settings.brightness=Math.max(.2,Math.min(1,value));renderBrightness();
+ if(show){clearTimeout(brightnessTimer);$('brightnessHud').hidden=false}
+}
+function finishBrightness(){
+ cancelAnimationFrame(brightnessFrame);brightnessFrame=0;
+ if(touchGesture?.brightness)updateBrightnessDrag();
+ $('readingDimmer').classList.remove('adjusting');
+ brightnessTimer=setTimeout(()=>$('brightnessHud').hidden=true,850);
+ clearTimeout(brightnessSaveTimer);brightnessSaveTimer=setTimeout(saveSettings,200);
+}
+function updateBrightnessDrag(){
+ brightnessFrame=0;const g=touchGesture;if(!g?.brightness)return;
+ setReadingBrightness(g.startBrightness+(g.currentX-g.x)/Math.max(180,$('viewport').clientWidth*.9),true);
+}
+function queueBrightnessDrag(){if(!brightnessFrame)brightnessFrame=requestAnimationFrame(updateBrightnessDrag)}
+
 $('viewport').addEventListener('scroll',()=>{
  if(suppress)return;lastScrollAt=Date.now();cancelHold();if(!handleDrag)hideSelection();
  clearTimeout(scrollTimer);scrollTimer=setTimeout(scheduleLocation,200);
 },{passive:true});
 $('viewport').addEventListener('pointerdown',e=>{
- if(e.isPrimary===false||e.button>0||suppress)return;
+ if(e.isPrimary===false||e.button>0||suppress||!active)return;
  const custom=e.pointerType==='touch'&&!settings.nativeSelection;
  $('reader').classList.toggle('touch-selection',custom);
- touchGesture={id:e.pointerId,x:e.clientX,y:e.clientY,time:Date.now(),scroll:$('viewport').scrollTop,custom,long:false,moved:false,hadSelection:!!getSelected()};
+ touchGesture={id:e.pointerId,x:e.clientX,y:e.clientY,currentX:e.clientX,time:Date.now(),scroll:$('viewport').scrollTop,custom,long:false,moved:false,axis:'',hadSelection:!!getSelected(),canBrighten:e.pointerType==='touch'&&settings.swipeBrightness&&!e.target.closest('a'),startBrightness:settings.brightness};
  cancelHold();if(!custom||e.target.closest('a'))return;
  holdTimer=setTimeout(()=>{
   if(!touchGesture||touchGesture.moved)return;
-  if(selectWordAt(touchGesture.x,touchGesture.y)){touchGesture.long=true;startSelectionGesture();ignoreClickUntil=Date.now()+700}
+  if(selectWordAt(touchGesture.x,touchGesture.y)){touchGesture.long=true;touchGesture.anchor={start:touchSelection.start,end:touchSelection.end};startSelectionGesture();ignoreClickUntil=Date.now()+700}
  },430);
 });
 $('viewport').addEventListener('pointermove',e=>{
  const g=touchGesture;if(!g||e.pointerId!==g.id)return;
- const moved=Math.hypot(e.clientX-g.x,e.clientY-g.y)>10;
- if(!g.long){if(moved){g.moved=true;cancelHold()}return}
- if(e.cancelable)e.preventDefault();
- const point=caretAtPoint(e.clientX,e.clientY);
- if(point&&touchSelection&&point.chapter===touchSelection.chapter){const bounds=wordBounds(point.chapter,point.offset);
-  if(bounds)selectTouchRange(point.chapter,Math.min(touchSelection.start,bounds.start),Math.max(touchSelection.start+1,bounds.end))}
+ const dx=e.clientX-g.x,dy=e.clientY-g.y;g.currentX=e.clientX;
+ if(g.brightness){queueBrightnessDrag();return}
+ if(!g.long){
+  if(Math.hypot(dx,dy)>10){
+   g.moved=true;cancelHold();
+   if(!g.axis)g.axis=Math.abs(dx)>Math.abs(dy)*1.6?'horizontal':'vertical';
+   if(g.axis==='horizontal'&&g.canBrighten&&!g.hadSelection){
+    g.brightness=true;ignoreClickUntil=Date.now()+600;hideSelection();$('readingDimmer').classList.add('adjusting');
+    try{$('viewport').setPointerCapture(e.pointerId)}catch{}queueBrightnessDrag();
+   }
+  }return;
+ }
+ if(e.cancelable)e.preventDefault();queueSelectionPoint(e.clientX,e.clientY,'extend',g.anchor);
 });
-
-$('viewport').addEventListener('touchstart',e=>{if(e.touches.length>1){cancelHold();stopSelectionGesture();touchGesture=null;hideSelection()}},{passive:true});
-$('viewport').addEventListener('pointercancel',()=>{cancelHold();stopSelectionGesture();touchGesture=null});
+$('viewport').addEventListener('touchstart',e=>{
+ if(e.touches.length>1){cancelHold();stopSelectionGesture();if(touchGesture?.brightness)finishBrightness();touchGesture=null;hideSelection()}
+},{passive:true});
+$('viewport').addEventListener('pointercancel',()=>{
+ cancelHold();stopSelectionGesture();if(touchGesture?.brightness)finishBrightness();
+ pendingSelectionPoint=null;cancelAnimationFrame(selectionFrame);selectionFrame=0;touchGesture=null;
+});
 $('viewport').addEventListener('pointerup',async e=>{
- cancelHold();stopSelectionGesture();const g=touchGesture;touchGesture=null;if(!g||e.pointerId!==g.id)return;
- if(g.long){ignoreClickUntil=Date.now()+500;return}
- const dx=e.clientX-g.x,dy=e.clientY-g.y;
- if(settings.mode==='pages'&&Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.6&&e.pointerType==='touch'&&!g.hadSelection&&!getSelected()){
+ cancelHold();stopSelectionGesture();const g=touchGesture;if(!g||e.pointerId!==g.id)return;
+ if(g.brightness){g.currentX=e.clientX;finishBrightness();touchGesture=null;ignoreClickUntil=Date.now()+500;return}
+ if(g.long){flushSelectionPoint();if(g.hapticOnRelease&&touchSelection)selectionHaptic();touchGesture=null;ignoreClickUntil=Date.now()+500;return}
+ touchGesture=null;const dx=e.clientX-g.x,dy=e.clientY-g.y;
+ if(!settings.swipeBrightness&&settings.mode==='pages'&&Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.6&&e.pointerType==='touch'&&!g.hadSelection&&!getSelected()){
   ignoreClickUntil=Date.now()+400;await turn(dx<0?1:-1);return;
  }
  if(Math.abs(dx)<8&&Math.abs(dy)<8&&Math.abs($('viewport').scrollTop-g.scroll)<5&&Date.now()-g.time<430){
@@ -712,6 +822,7 @@ $('viewport').addEventListener('pointerup',async e=>{
   if(!e.target.closest('a,mark')&&!getSelected())toggleChrome();
  }
 });
+
 $('bookText').addEventListener('contextmenu',e=>{
  if(settings.nativeSelection)return;
  e.preventDefault();if(!getSelected())selectWordAt(e.clientX,e.clientY);else showSelectionTools(getSelected());
@@ -730,27 +841,26 @@ $('closeSelection').onclick=()=>{getSelection()?.removeAllRanges();hideSelection
 for(const [id,isEnd] of [['selectionStart',false],['selectionEnd',true]]){
  const handle=$(id);
  handle.addEventListener('pointerdown',e=>{
-  if(!touchSelection)return;e.preventDefault();cancelHold();handleDrag={id:e.pointerId,isEnd};handle.setPointerCapture(e.pointerId);
+  if(!touchSelection||e.isPrimary===false||e.button>0)return;e.preventDefault();cancelHold();handleDrag={id:e.pointerId,isEnd};
+  try{handle.setPointerCapture(e.pointerId)}catch{}
  });
  handle.addEventListener('pointermove',e=>{
   if(!handleDrag||handleDrag.id!==e.pointerId||!touchSelection)return;e.preventDefault();
-  cancelAnimationFrame(selectionFrame);const x=e.clientX,y=e.clientY;
-  selectionFrame=requestAnimationFrame(()=>{
-   if(!touchSelection||!handleDrag)return;const point=caretAtPoint(x,y-12);if(!point||point.chapter!==touchSelection.chapter)return;
-   const bounds=wordBounds(point.chapter,point.offset);if(!bounds)return;
-   const start=isEnd?touchSelection.start:Math.min(bounds.start,touchSelection.end-1),end=isEnd?Math.max(bounds.end,touchSelection.start+1):touchSelection.end;
-   selectTouchRange(point.chapter,start,end);
-  });
+  queueSelectionPoint(e.clientX,e.clientY-12,isEnd?'end':'start');
  });
- const finish=e=>{if(handleDrag?.id===e.pointerId){handleDrag=null;ignoreClickUntil=Date.now()+350;if(handle.hasPointerCapture(e.pointerId))handle.releasePointerCapture(e.pointerId)}};
- handle.addEventListener('pointerup',finish);handle.addEventListener('pointercancel',finish);
+ const finish=e=>{
+  if(handleDrag?.id!==e.pointerId)return;
+  if(e.type==='pointercancel'){pendingSelectionPoint=null;cancelAnimationFrame(selectionFrame);selectionFrame=0}else flushSelectionPoint();
+  handleDrag=null;ignoreClickUntil=Date.now()+350;if(handle.hasPointerCapture(e.pointerId))handle.releasePointerCapture(e.pointerId);
+ };
+ handle.addEventListener('pointerup',finish);handle.addEventListener('pointercancel',finish);handle.addEventListener('lostpointercapture',finish);
  handle.addEventListener('keydown',e=>{
   if(!touchSelection||!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();const step=e.key==='ArrowRight'?1:-1;
   selectTouchRange(touchSelection.chapter,isEnd?touchSelection.start:Math.min(touchSelection.end-1,touchSelection.start+step),isEnd?Math.max(touchSelection.start+1,touchSelection.end+step):touchSelection.end);
  });
 }
 
-$('drawer').addEventListener('change',async e=>{if(e.target.id==='darkModeToggle'){await setDarkMode(e.target.checked);return}if(e.target.id==='selectionMode'){await applySetting('nativeSelection',e.target.value==='browser');return}if(e.target.id==='fontSelect')await applySetting('font',e.target.value);if(e.target.id==='paperColor')await applySetting('paper',e.target.value);if(e.target.id==='inkColor')await applySetting('ink',e.target.value)});$('drawer').addEventListener('input',e=>{const id=e.target.id;if(id!=='fontSize'&&id!=='lineSpacing')return;const val=+e.target.value;$(id==='fontSize'?'fontSizeValue':'lineValue').textContent=id==='fontSize'?val+'px':val.toFixed(1);clearTimeout(layoutTimer);layoutTimer=setTimeout(()=>applySetting(id==='fontSize'?'size':'leading',val),90)});$('drawer').addEventListener('click',async e=>{if(e.target.closest('#resetSettings')){const pos=visibleAnchor();settings={...defaults};loadSettings();await saveSettings();await layout(pos,true);if(drawerKind==='settings')showDrawer('settings')}});
+$('drawer').addEventListener('change',async e=>{if(e.target.id==='brightnessSwipe'){settings.swipeBrightness=e.target.checked;await saveSettings();return}if(e.target.id==='selectionHaptics'){settings.selectionHaptics=e.target.checked;await saveSettings();return}if(e.target.id==='readingBrightness'){await saveSettings();return}if(e.target.id==='darkModeToggle'){await setDarkMode(e.target.checked);return}if(e.target.id==='selectionMode'){await applySetting('nativeSelection',e.target.value==='browser');return}if(e.target.id==='fontSelect')await applySetting('font',e.target.value);if(e.target.id==='paperColor')await applySetting('paper',e.target.value);if(e.target.id==='inkColor')await applySetting('ink',e.target.value)});$('drawer').addEventListener('input',e=>{if(e.target.id==='readingBrightness'){setReadingBrightness(+e.target.value/100);return}const id=e.target.id;if(id!=='fontSize'&&id!=='lineSpacing')return;const val=+e.target.value;$(id==='fontSize'?'fontSizeValue':'lineValue').textContent=id==='fontSize'?val+'px':val.toFixed(1);clearTimeout(layoutTimer);layoutTimer=setTimeout(()=>applySetting(id==='fontSize'?'size':'leading',val),90)});$('drawer').addEventListener('click',async e=>{if(e.target.closest('#resetSettings')){const pos=visibleAnchor();settings={...defaults};loadSettings();await saveSettings();await layout(pos,true);if(drawerKind==='settings')showDrawer('settings')}});
 document.addEventListener('keydown',e=>{const modal=!$('noteOverlay').hidden?$('noteOverlay'):!$('confirmOverlay').hidden?$('confirmOverlay'):!$('drawerOverlay').hidden?$('drawerOverlay'):null;if(e.key==='Escape'){if(!$('noteOverlay').hidden)closeNote();else if(!$('confirmOverlay').hidden)$('cancelRemove').click();else if(!$('drawerOverlay').hidden)closeDrawer();else if(!$('selectionTools').hidden){getSelection()?.removeAllRanges();hideSelection()}else if(active)toggleChrome(true);return}if(e.key==='Tab'&&modal){const list=[...modal.querySelectorAll('button,input,select,textarea,[tabindex="0"]')].filter(el=>!el.hidden&&!el.disabled&&el.getClientRects().length);if(!list.length)return;const first=list[0],last=list[list.length-1];if(e.shiftKey&&(document.activeElement===first||!modal.contains(document.activeElement))){e.preventDefault();last.focus()}else if(!e.shiftKey&&(document.activeElement===last||!modal.contains(document.activeElement))){e.preventDefault();first.focus()}return}if(!active||modal||e.target.closest('input,textarea,select,button,a,mark'))return;if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' '&&!e.shiftKey){e.preventDefault();turn(1)}else if(e.key==='ArrowLeft'||e.key==='PageUp'||e.key===' '&&e.shiftKey){e.preventDefault();turn(-1)}else if(e.key.toLowerCase()==='f')toggleChrome()});
 document.addEventListener('dragenter',e=>{if(e.dataTransfer?.types.includes('Files')){e.preventDefault();dragDepth++;$('dragLayer').hidden=false}});document.addEventListener('dragover',e=>{if(e.dataTransfer?.types.includes('Files')){e.preventDefault();e.dataTransfer.dropEffect='copy'}});document.addEventListener('dragleave',e=>{if(e.dataTransfer?.types.includes('Files')){dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)$('dragLayer').hidden=true}});document.addEventListener('drop',e=>{e.preventDefault();dragDepth=0;$('dragLayer').hidden=true;if(e.dataTransfer?.files.length)importFiles(e.dataTransfer.files)});
 let resizeTimer;addEventListener('resize',handleReaderResize,{passive:true});
